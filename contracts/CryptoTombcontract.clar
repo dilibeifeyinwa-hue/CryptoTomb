@@ -143,7 +143,7 @@
     
     ;; Validate oracle if specified
     (match oracle-contract
-      oracle-addr (asserts! (default-to false (get is-trusted (map-get? trusted-oracles { oracle-address: oracle-addr }))) ERR-INVALID-ORACLE)
+      oracle-addr (asserts! (match (map-get? trusted-oracles { oracle-address: oracle-addr }) data (get is-trusted data) false) ERR-INVALID-ORACLE)
       true)
     
     ;; Store message
@@ -152,7 +152,7 @@
         creator: tx-sender,
         encrypted-content: encrypted-content,
         content-hash: content-hash,
-        creation-block: block-height,
+        creation-block: stacks-block-height,
         access-count: u0,
         is-deleted: false,
         metadata: metadata
@@ -281,17 +281,13 @@
     ;; Check condition based on type
     (let ((should-delete 
       (if (is-eq (get condition-type condition) "time")
-        (>= block-height (get condition-value condition))
+        (>= stacks-block-height (get condition-value condition))
         (if (is-eq (get condition-type condition) "block")
-          (>= block-height (get condition-value condition))
+          (>= stacks-block-height (get condition-value condition))
           (if (is-eq (get condition-type condition) "oracle")
-            (match (get oracle-contract condition)
-              oracle-addr (match (get oracle-key condition)
-                key (match (contract-call? oracle-addr get-value key)
-                  oracle-response (>= (unwrap-panic oracle-response) (get condition-value condition))
-                  false)
-                false)
-              false)
+            ;; TODO: Wire to a statically-bound oracle implementing oracle-trait via use-trait
+            ;; Dynamic contract calls are not allowed in Clarity; this path returns false until bound.
+            false
             false)))))
       
       (if should-delete
@@ -334,7 +330,7 @@
     (asserts! (is-eq (get beneficiary inheritance) tx-sender) ERR-UNAUTHORIZED)
     (asserts! (not (get is-deleted msg)) ERR-MESSAGE-DELETED)
     (asserts! (not (get is-claimed inheritance)) ERR-ALREADY-EXISTS)
-    (asserts! (>= block-height (+ (get creation-block msg) (get activation-delay inheritance))) ERR-CONDITION-NOT-MET)
+    (asserts! (>= stacks-block-height (+ (get creation-block msg) (get activation-delay inheritance))) ERR-CONDITION-NOT-MET)
     
     ;; Mark as claimed
     (map-set inheritance-config { message-id: message-id }
@@ -344,7 +340,7 @@
     (map-set access-permissions { message-id: message-id, accessor: tx-sender }
       {
         permission-level: u3,
-        granted-at: block-height,
+        granted-at: stacks-block-height,
         expires-at: none,
         granted-by: (get creator msg)
       })
@@ -366,7 +362,7 @@
       {
         old-key-hash: (get public-key-hash auth-key),
         new-key-hash: new-key-hash,
-        rotation-block: block-height,
+        rotation-block: stacks-block-height,
         initiated-by: tx-sender
       })
     
@@ -386,7 +382,7 @@
     (map-set trusted-oracles { oracle-address: oracle-address }
       {
         is-trusted: true,
-        added-at: block-height,
+        added-at: stacks-block-height,
         oracle-type: oracle-type
       })
     
@@ -398,3 +394,79 @@
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
     (var-set contract-paused (not (var-get contract-paused)))
     (ok (var-get contract-paused))))
+
+;; read only functions
+
+;; Get message info (without encrypted content)
+(define-read-only (get-message-info (message-id uint))
+  (match (map-get? messages { message-id: message-id })
+    msg (ok {
+      creator: (get creator msg),
+      creation-block: (get creation-block msg),
+      access-count: (get access-count msg),
+      is-deleted: (get is-deleted msg),
+      metadata: (get metadata msg)
+    })
+    ERR-NOT-FOUND))
+
+;; Get deletion condition status
+(define-read-only (get-deletion-status (message-id uint))
+  (map-get? deletion-conditions { message-id: message-id }))
+
+;; Get threshold configuration
+(define-read-only (get-threshold-config (message-id uint))
+  (map-get? threshold-config { message-id: message-id }))
+
+;; Check if user is authorized for message
+(define-read-only (is-authorized (message-id uint) (user principal))
+  (match (map-get? authorized-keys { message-id: message-id, key-holder: user })
+    auth-key (get is-active auth-key)
+    false))
+
+;; Get inheritance configuration
+(define-read-only (get-inheritance-config (message-id uint))
+  (map-get? inheritance-config { message-id: message-id }))
+
+;; Get current message counter
+(define-read-only (get-message-counter)
+  (var-get message-counter))
+
+;; Check if oracle is trusted
+(define-read-only (is-trusted-oracle (oracle-address principal))
+  (match (map-get? trusted-oracles { oracle-address: oracle-address })
+    data (get is-trusted data)
+    false))
+
+;; Get contract status
+(define-read-only (get-contract-status)
+  {
+    paused: (var-get contract-paused),
+    emergency-mode: (var-get emergency-mode),
+    total-messages: (var-get message-counter)
+  })
+
+;; private functions
+
+;; Validate message exists and is accessible
+(define-private (validate-message-access (message-id uint) (accessor principal))
+  (let ((msg (unwrap! (map-get? messages { message-id: message-id }) ERR-NOT-FOUND)))
+    (asserts! (not (get is-deleted msg)) ERR-MESSAGE-DELETED)
+    (ok msg)))
+
+;; Clean up expired permissions
+(define-private (cleanup-expired-permissions (message-id uint) (accessor principal))
+  (match (map-get? access-permissions { message-id: message-id, accessor: accessor })
+    permission (match (get expires-at permission)
+      expiry (if (>= stacks-block-height expiry)
+        (begin
+          (map-delete access-permissions { message-id: message-id, accessor: accessor })
+          false)
+        true)
+      true)
+    false))
+
+;; Calculate signature threshold requirements
+(define-private (calculate-threshold-met (message-id uint))
+  (match (map-get? threshold-config { message-id: message-id })
+    threshold (>= (get current-signatures threshold) (get required-signatures threshold))
+    false))
